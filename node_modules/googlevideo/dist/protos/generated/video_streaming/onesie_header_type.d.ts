@@ -1,0 +1,16 @@
+export declare const protobufPackage = "video_streaming";
+export declare enum OnesieHeaderType {
+    ONESIE_PLAYER_RESPONSE = 0,
+    MEDIA = 1,
+    MEDIA_DECRYPTION_KEY = 2,
+    CLEAR_MEDIA = 3,
+    CLEAR_INIT_SEGMENT = 4,
+    ACK = 5,
+    MEDIA_STREAMER_HOSTNAME = 6,
+    MEDIA_SIZE_HINT = 7,
+    PLAYER_SERVICE_RESPONSE_PUSH_URL = 8,
+    LAST_HIGH_PRIORITY_HINT = 9,
+    STREAM_METADATA = 16,
+    ENCRYPTED_INNERTUBE_RESPONSE_PART = 25,
+    UNRECOGNIZED = -1
+}

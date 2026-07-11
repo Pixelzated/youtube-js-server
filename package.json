@@ -1,0 +1,30 @@
+{
+  "name": "standalone-youtube-stream-server",
+  "version": "1.0.0",
+  "description": "Standalone Node.js HTTP server that streams YouTube audio using SABR (Server-Adaptive Bitrate) via googlevideo + youtubei.js.",
+  "type": "module",
+  "main": "dist/server.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/server.js",
+    "dev": "tsx src/server.ts",
+    "clean": "rimraf dist"
+  },
+  "dependencies": {
+    "bgutils-js": "^3.2.0",
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "googlevideo": "^4.0.4",
+    "jsdom": "^29.1.1",
+    "youtubei.js": "^17.2.0"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.19",
+    "@types/express": "^5.0.6",
+    "@types/jsdom": "^21.1.7",
+    "@types/node": "^25.0.3",
+    "rimraf": "^6.0.1",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3"
+  }
+}
