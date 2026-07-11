@@ -1,5 +1,7 @@
 # Standalone YouTube Audio Stream Server
 
+AI DISCLOSURE - This entire project was almost exclusively made with GLM 5.2 for a private project, so if that bothers you don't use this I guess?
+
 A standalone Node.js HTTP server that streams YouTube audio using YouTube's
 SABR (Server-Adaptive Bitrate) protocol. It exposes an HTTP endpoint that
 supports HTTP `Range` requests, so any standard media player (VLC, HTML5
