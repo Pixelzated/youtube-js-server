@@ -1,25 +1,12 @@
 import express from 'express';
-import cors from 'cors';
 import { EventEmitter } from 'node:events';
 import { EnabledTrackTypes } from 'googlevideo/utils';
 import { createSabrAudioStream } from './sabr-stream-factory.js';
-import { search, getMetadata, getAlbum, getArtist, getPlaylist } from './metadata-factory.js';
+import { search, getMetadata, getAlbum, getArtist } from './metadata-factory.js';
 const app = express();
 app.use(express.json());
-app.use(cors());
 const PORT = Number(process.env.PORT ?? 3001);
 const HOST = process.env.HOST ?? '0.0.0.0';
-/**
- * Maximum number of concurrent SABR downloads allowed at once. When the limit
- * is reached, the oldest active stream is evicted (aborted) to make room for
- * the new request — requests are never denied, the oldest stream is simply
- * closed. Set to `0` to disable the limit entirely.
- *
- * Note: this counts *active downloads* (tracks that are not yet `done`).
- * Completed downloads that remain in the buffer for reuse do not count
- * against the limit.
- */
-const MAX_CONCURRENT_STREAMS = Number(process.env.MAX_CONCURRENT_STREAMS ?? 3);
 /**
  * Default playback options: audio-only, prefer Opus (best quality webm audio).
  * Callers can override per-request via the `?quality=` / `?format=` query
@@ -31,75 +18,15 @@ const DEFAULT_OPTIONS = {
 };
 const tracks = new Map();
 /**
- * Returns the number of tracks that are actively downloading (not yet done).
- * Completed tracks remaining in the buffer for reuse do not count against
- * the concurrency limit.
- */
-function countActiveStreams() {
-    let count = 0;
-    for (const track of tracks.values()) {
-        if (!track.done)
-            count++;
-    }
-    return count;
-}
-/**
- * Finds and aborts the oldest active (not-yet-done) SABR download to make
- * room for a new stream. The evicted track's buffer is freed and any clients
- * currently reading from it will have their connection destroyed.
- */
-function evictOldestStream() {
-    let oldest;
-    let oldestKey;
-    for (const [key, track] of tracks) {
-        if (track.done)
-            continue; // skip completed downloads
-        if (oldest === undefined || track.startedAt < oldest.startedAt) {
-            oldest = track;
-            oldestKey = key;
-        }
-    }
-    if (!oldest || !oldestKey)
-        return;
-    console.log(`[stream] evicting oldest active stream ${oldestKey} ` +
-        `(started ${Date.now() - oldest.startedAt}ms ago) to make room for new request`);
-    // Abort the underlying SABR download. This will cause the reader loop in
-    // getOrStartTrack to throw, which sets track.done/error and emits 'error'.
-    // The catch block already deletes the track from the map.
-    try {
-        oldest.sabrStream?.abort();
-    }
-    catch {
-        // abort() can throw if the stream is already closing — ignore.
-    }
-    // If abort didn't trigger the catch path fast enough (e.g. the stream was
-    // already past the reader loop), ensure the track is cleaned up.
-    if (tracks.has(oldestKey)) {
-        oldest.done = true;
-        oldest.ready = true;
-        oldest.error = new Error('Stream evicted to make room for a new request');
-        tracks.delete(oldestKey);
-        oldest.emitter.emit('error', oldest.error);
-    }
-}
-/**
  * Returns an existing in-progress track, or starts a new SABR download for
  * the given video id. The download runs in the background and emits
  * 'ready' | 'data' | 'end' | 'error' on its emitter so HTTP handlers can
  * stream bytes as they arrive.
- *
- * If the concurrency limit has been reached, the oldest active stream is
- * evicted (aborted) before the new one starts — the request is never denied.
  */
 function getOrStartTrack(videoId, options) {
     const existing = tracks.get(videoId);
     if (existing)
         return existing;
-    // Evict the oldest active stream if we're at the concurrency limit.
-    // (0 = unlimited, so skip the check entirely in that case.)
-    if (MAX_CONCURRENT_STREAMS > 0 && countActiveStreams() >= MAX_CONCURRENT_STREAMS) {
-        evictOldestStream();
-    }
     const track = {
         chunks: [],
         downloadedLength: 0,
@@ -124,12 +51,17 @@ function getOrStartTrack(videoId, options) {
             track.ready = true;
             track.emitter.emit('ready');
             const reader = streamResults.audioStream.getReader();
+            const tReaderStart = Date.now();
+            console.log(`[stream] ${videoId} reader started at ${Date.now() - track.startedAt}ms after request`);
             for (;;) {
                 const { done, value } = await reader.read();
                 if (done)
                     break;
                 if (!value)
                     continue;
+                if (track.downloadedLength === 0) {
+                    console.log(`[stream] ${videoId} first audio chunk at ${Date.now() - track.startedAt}ms (reader waited ${Date.now() - tReaderStart}ms, ${value.byteLength} bytes)`);
+                }
                 track.chunks.push(Buffer.from(value));
                 track.downloadedLength += value.byteLength;
                 track.emitter.emit('data');
@@ -348,14 +280,6 @@ app.get('/stream/:id', async (req, res) => {
 const VIDEO_ID_RE = /^[A-Za-z0-9_-]{6,}$/;
 const ALBUM_ID_RE = /^MPRE[\w-]+$/;
 const ARTIST_ID_RE = /^UC[\w-]+$/;
-/**
- * Playlist ids come in several prefixes: `PL...` (user playlists),
- * `OLAK5uy...` (albums-as-playlists), `RDCLAK...` (curated), `RD...` (radio),
- * `UU...` (channel uploads), `LL...` (liked), `FL...` (favorites), plus
- * arbitrary ids for some music playlists. We accept any non-empty
- * alphanumeric/`-`/`_` id, optionally prefixed with `VL`.
- */
-const PLAYLIST_ID_RE = /^(VL)?[A-Za-z0-9_-]{6,}$/;
 /** Sends a consistent JSON error without leaking stack traces. */
 function sendError(res, status, message) {
     res.status(status).json({ error: message });
@@ -438,46 +362,11 @@ app.get('/artist/:id', async (req, res) => {
         sendError(res, 500, 'Artist lookup failed');
     }
 });
-app.get('/playlist/:id', async (req, res) => {
-    const playlistId = req.params.id;
-    if (!PLAYLIST_ID_RE.test(playlistId)) {
-        sendError(res, 400, 'Invalid playlist id');
-        return;
-    }
-    // Optional `?idsOnly=true` returns just the video id array (lighter payload
-    // for clients that only need ids, e.g. to feed into /stream/:id).
-    const idsOnly = req.query.idsOnly === 'true';
-    try {
-        const playlist = await getPlaylist(playlistId);
-        if (!playlist) {
-            sendError(res, 404, 'Playlist not found or is empty');
-            return;
-        }
-        if (idsOnly) {
-            res.json({
-                id: playlist.id,
-                title: playlist.title,
-                videoCount: playlist.videoCount,
-                returnedCount: playlist.returnedCount,
-                videoIds: playlist.videoIds
-            });
-            return;
-        }
-        res.json(playlist);
-    }
-    catch (e) {
-        console.error('[metadata] getPlaylist failed:', e);
-        sendError(res, 500, 'Playlist lookup failed');
-    }
-});
 // Simple health/info endpoint.
 app.get('/health', (_req, res) => {
-    const activeCount = countActiveStreams();
     res.json({
         status: 'ok',
         activeTracks: tracks.size,
-        activeDownloads: activeCount,
-        maxConcurrentStreams: MAX_CONCURRENT_STREAMS > 0 ? MAX_CONCURRENT_STREAMS : 'unlimited',
         tracks: Array.from(tracks.entries()).map(([id, t]) => ({
             id,
             ready: t.ready,
@@ -485,7 +374,6 @@ app.get('/health', (_req, res) => {
             downloaded: t.downloadedLength,
             total: t.totalSize,
             mimeType: t.mimeType,
-            ageMs: Date.now() - t.startedAt,
             error: t.error?.message
         }))
     });
@@ -497,11 +385,6 @@ app.listen(PORT, HOST, () => {
     console.log(`  Metadata: http://${HOST}:${PORT}/metadata/<videoId>`);
     console.log(`  Album:    http://${HOST}:${PORT}/album/<albumId>`);
     console.log(`  Artist:   http://${HOST}:${PORT}/artist/<artistId>`);
-    console.log(`  Playlist: http://${HOST}:${PORT}/playlist/<playlistId>`);
     console.log(`  Health:   http://${HOST}:${PORT}/health`);
-    const limitStr = MAX_CONCURRENT_STREAMS > 0
-        ? `${MAX_CONCURRENT_STREAMS} (oldest evicted when exceeded)`
-        : 'unlimited';
-    console.log(`  Max concurrent SABR streams: ${limitStr}`);
 });
 //# sourceMappingURL=server.js.map

@@ -1,4 +1,4 @@
-import { getMetadataInnertube, getPlaylistInnertube } from './innertube-helper.js';
+import { getMetadataInnertube } from './innertube-helper.js';
 import { YTNodes } from 'youtubei.js';
 /**
  * youtubei.js metadata subsystem.
@@ -197,10 +197,7 @@ export async function getMetadata(videoId) {
     const innertube = await getMetadataInnertube();
     let info;
     try {
-        console.time('maybe');
         info = await innertube.music.getInfo(videoId);
-        console.time('maybe');
-        console.log('INFO STARTS NOW ' + info);
     }
     catch {
         // Some ids are not available on the YTMUSIC client (e.g. plain non-music
@@ -395,138 +392,6 @@ export async function getArtist(artistId) {
         name,
         thumbnails,
         ...(subscribers ? { subscribers } : {})
-    };
-}
-// ---------------------------------------------------------------------------
-// Playlist
-// ---------------------------------------------------------------------------
-/**
- * Maximum number of continuation pages to fetch before giving up. Each page
- * typically holds ~100 videos, so 200 pages covers playlists up to ~20,000
- * entries — well beyond any real-world playlist. This is a safety cap to
- * prevent infinite loops on malformed responses, not a practical limit.
- */
-const MAX_PLAYLIST_PAGES = 200;
-/**
- * Maps a single playlist item into the lightweight `PlaylistVideoEntry`
- * shape. Handles both the legacy `PlaylistVideo` node and the newer
- * `LockupView` node that the current YouTube web UI returns for playlist
- * rows. Returns `null` for entries without a usable id (e.g. private/deleted
- * placeholders, or non-video lockups like channels/playlists).
- */
-function mapPlaylistItem(item, index) {
-    // Legacy PlaylistVideo node: has `.id`, `.title`, `.duration`.
-    if (item.is(YTNodes.PlaylistVideo)) {
-        const v = item;
-        if (!v.id)
-            return null;
-        return {
-            id: v.id,
-            title: v.title?.text ?? 'Unknown',
-            index,
-            ...(v.duration?.seconds !== undefined
-                ? { duration: makeDuration(v.duration.seconds, v.duration.text) }
-                : {})
-        };
-    }
-    // Newer LockupView node: has `content_id`, `content_type`, `metadata.title`.
-    if (item.is(YTNodes.LockupView)) {
-        const lv = item;
-        // Only VIDEO lockups are playlist entries; skip channels/playlists/etc.
-        if (lv.content_type !== 'VIDEO')
-            return null;
-        if (!lv.content_id)
-            return null;
-        return {
-            id: lv.content_id,
-            title: lv.metadata?.title?.text ?? 'Unknown',
-            index
-            // LockupView does not expose a duration; clients can fetch per-video
-            // metadata via getMetadata() if needed.
-        };
-    }
-    return null;
-}
-/**
- * Retrieves all video ids from a YouTube playlist, handling pagination for
- * very large playlists (1000+ videos).
- *
- * Uses `Innertube.getPlaylist()` (the regular WEB client's continuable
- * `parser/youtube/Playlist`), which exposes `items` for the current page and
- * `getContinuation()` to fetch the next page. We loop until there is no
- * continuation or the safety cap is reached, collecting every `PlaylistVideo`
- * id along the way.
- *
- * The YTMUSIC client's `music.getPlaylist()` returns a *compact* `Playlist`
- * node (`parser/classes/Playlist`) that only carries `first_videos` with no
- * continuation support, so it cannot be used for large playlists.
- *
- * @param playlistId A YouTube playlist id (`PL...`, `OLAK5uy...`, `RDCLAK...`,
- *   etc.). Also accepts `VL`-prefixed ids and bare ids.
- */
-export async function getPlaylist(playlistId) {
-    // Use the regular WEB client — the YTMUSIC (WEB_REMIX) client returns a
-    // music-formatted browse response whose playlist items the continuable
-    // `parser/youtube/Playlist` parser cannot extract.
-    const innertube = await getPlaylistInnertube();
-    // Normalize: YouTube accepts the bare id; strip a leading "VL" that some
-    // URLs carry (e.g. youtube.com/playlist?list=VL...). Innertube.getPlaylist
-    // re-adds the VL prefix internally.
-    const id = playlistId.replace(/^VL/, '');
-    let page;
-    try {
-        page = await innertube.getPlaylist(id);
-    }
-    catch (e) {
-        console.warn('[playlist] getPlaylist failed:', e instanceof Error ? e.message : e);
-        return null;
-    }
-    const title = page.info?.title ?? 'Unknown Playlist';
-    const videoCountText = page.info?.total_items;
-    const videoCount = videoCountText ? parseInt(videoCountText.replace(/\D/g, ''), 10) : undefined;
-    const allEntries = [];
-    const seen = new Set();
-    let pageIndex = 0;
-    for (;;) {
-        const items = page.items ?? [];
-        for (const item of items) {
-            // A playlist page can contain a mix of node types: legacy
-            // `PlaylistVideo`, newer `LockupView`, plus `ReelItem` /
-            // `ShortsLockupView` for shorts. mapPlaylistItem handles the video
-            // variants and returns null for everything else.
-            const entry = mapPlaylistItem(item, allEntries.length + 1);
-            if (!entry)
-                continue;
-            if (seen.has(entry.id))
-                continue; // dedupe across pages
-            seen.add(entry.id);
-            allEntries.push(entry);
-        }
-        if (!page.has_continuation)
-            break;
-        if (pageIndex >= MAX_PLAYLIST_PAGES) {
-            console.warn(`[playlist] reached MAX_PLAYLIST_PAGES (${MAX_PLAYLIST_PAGES}) for ${id}; ` +
-                `returning ${allEntries.length} of ~${videoCount ?? '?'} videos`);
-            break;
-        }
-        try {
-            page = await page.getContinuation();
-        }
-        catch (e) {
-            console.warn(`[playlist] continuation failed on page ${pageIndex + 1}:`, e);
-            break;
-        }
-        pageIndex++;
-    }
-    if (allEntries.length === 0)
-        return null;
-    return {
-        id,
-        title,
-        ...(Number.isFinite(videoCount) ? { videoCount } : {}),
-        returnedCount: allEntries.length,
-        videoIds: allEntries.map((e) => e.id),
-        videos: allEntries
     };
 }
 //# sourceMappingURL=metadata-factory.js.map

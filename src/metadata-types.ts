@@ -100,29 +100,3 @@ export interface ArtistMetadata {
   thumbnails: MetadataThumbnail[];
   subscribers?: string;
 }
-
-/**
- * A single video entry from a playlist.
- *
- * Only the fields needed to identify and play a track are included; richer
- * per-video metadata can be fetched on demand via `getMetadata(videoId)`.
- */
-export interface PlaylistVideoEntry {
-  id: string;
-  title: string;
-  /** Position of the video in the playlist (1-based). */
-  index: number;
-  duration?: MetadataDuration;
-}
-
-export interface PlaylistMetadata {
-  id: string;
-  title: string;
-  /** Total number of videos reported by YouTube, when available. */
-  videoCount?: number;
-  /** Number of video ids actually returned (may be less than videoCount for
-   * private/deleted entries). */
-  returnedCount: number;
-  videoIds: string[];
-  videos: PlaylistVideoEntry[];
-}

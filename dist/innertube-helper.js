@@ -31,32 +31,4 @@ export async function getMetadataInnertube() {
     });
     return metadataInnertube;
 }
-/**
- * Lazily-initialized, reusable Innertube instance for **playlist** lookups.
- *
- * `Innertube.getPlaylist()` (the continuable `parser/youtube/Playlist`) only
- * returns usable `PlaylistVideo` items when the browse request is issued from
- * the regular **WEB** client. The YTMUSIC (`WEB_REMIX`) client returns a
- * music-formatted browse response whose playlist items the `Playlist` parser
- * cannot extract (items come back empty even though a continuation exists).
- *
- * We therefore keep a dedicated WEB instance here, separate from the music
- * metadata instance, and reuse it for the lifetime of the process.
- */
-let playlistInnertube;
-/**
- * Returns the shared playlist Innertube instance (regular WEB client),
- * creating it on first use.
- */
-export async function getPlaylistInnertube() {
-    if (playlistInnertube)
-        return playlistInnertube;
-    playlistInnertube = await Innertube.create({
-        cache: new UniversalCache(true),
-        // The plain WEB client is required for getPlaylist() to return
-        // continuable PlaylistVideo items.
-        client_type: ClientType.WEB
-    });
-    return playlistInnertube;
-}
 //# sourceMappingURL=innertube-helper.js.map

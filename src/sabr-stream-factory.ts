@@ -89,9 +89,11 @@ export async function createSabrAudioStream(
   // NOTE: do NOT use the MUSIC client — it breaks PoToken generation.
   const innertube = await getStreamingInnertube();
 
+  const t0 = Date.now();
   // Generate the Web PoToken. This reuses the cached WebPoMinter (created
   // once on first use) and just mints a per-video token — cheap, no network.
   const webPoTokenResult = await generateWebPoToken(innertube, videoId);
+  const tPo = Date.now();
 
   // Use getBasicInfo() instead of getInfo() — getInfo() makes TWO API calls
   // (watch + watch_next) and waits for both via Promise.all. The watch_next
@@ -103,6 +105,7 @@ export async function createSabrAudioStream(
     client: 'WEB',
     po_token: webPoTokenResult.poToken
   });
+  const tInfo = Date.now();
   const videoTitle = info.basic_info?.title || 'Unknown Video';
   const durationMs = (info.basic_info?.duration ?? 0) * 1000;
 
@@ -127,8 +130,6 @@ export async function createSabrAudioStream(
     formats: sabrFormats,
     serverAbrStreamingUrl,
     videoPlaybackUstreamerConfig,
-    // Pass the real PoToken up front (same as the official googlevideo
-    // downloader example). The placeholder is kept as a fallback.
     poToken: webPoTokenResult.poToken || webPoTokenResult.placeholderPoToken,
     clientInfo: {
       clientName: parseInt(
@@ -137,6 +138,36 @@ export async function createSabrAudioStream(
         ]
       ),
       clientVersion: innertube.session.context.client.clientVersion
+    },
+    fetch: async (input: any, init?: any) => {
+      const t = Date.now();
+      const res = await fetch(input, init);
+      const tHeaders = Date.now();
+      // Wrap body to time each chunk read
+      const origBody = res.body;
+      let chunkCount = 0;
+      let totalBytes = 0;
+      const wrappedBody = new ReadableStream({
+        async start(controller) {
+          if (!origBody) { controller.close(); return; }
+          const reader = origBody.getReader();
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) {
+              console.log(`[sabr-fetch] ${videoId} body done: ${Date.now() - tHeaders}ms, ${chunkCount} chunks, ${totalBytes} bytes`);
+              controller.close();
+              return;
+            }
+            if (value) {
+              chunkCount++;
+              totalBytes += value.byteLength;
+              if (chunkCount <= 3) console.log(`[sabr-fetch] ${videoId} body chunk#${chunkCount}: ${value.byteLength}b at ${Date.now() - tHeaders}ms`);
+              controller.enqueue(value);
+            }
+          }
+        }
+      });
+      return new Response(wrappedBody, { status: res.status, statusText: res.statusText, headers: res.headers });
     }
   });
 
@@ -178,6 +209,7 @@ export async function createSabrAudioStream(
   });
 
   const { audioStream, selectedFormats } = await sabrStream.start(options);
+  console.log(`[sabr] ${videoId} setup: poToken=${tPo - t0}ms getInfo=${tInfo - tPo}ms start=${Date.now() - tInfo}ms total=${Date.now() - t0}ms`);
 
   return {
     innertube,
