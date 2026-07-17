@@ -12,8 +12,13 @@ import { Innertube, UniversalCache, ClientType } from 'youtubei.js';
  *
  * The instance is created once and reused for the lifetime of the process.
  * youtubei.js' own `UniversalCache` handles session caching.
+ *
+ * The in-flight creation `Promise` itself (not just its resolved value) is
+ * memoized: without this, concurrent calls that land before the first
+ * `Innertube.create()` resolves would each kick off their own session
+ * creation, defeating the "single shared instance" point of this module.
  */
-let metadataInnertube: Innertube | undefined;
+let metadataInnertube: Promise<Innertube> | undefined;
 
 /**
  * Returns the shared metadata Innertube instance, creating it on first use.
@@ -21,17 +26,20 @@ let metadataInnertube: Innertube | undefined;
  * NOTE: This is a separate instance from anything the streaming code uses.
  * Streaming and metadata are intentionally independent subsystems.
  */
-export async function getMetadataInnertube(): Promise<Innertube> {
-  if (metadataInnertube) return metadataInnertube;
-
-  metadataInnertube = await Innertube.create({
-    cache: new UniversalCache(true),
-    // YTMUSIC gives us music.search / music.getInfo / music.getAlbum /
-    // music.getArtist with rich, music-oriented metadata (album, artists,
-    // release year, etc.) that the plain WEB client does not expose.
-    client_type: ClientType.MUSIC
-  });
-
+export function getMetadataInnertube(): Promise<Innertube> {
+  if (!metadataInnertube) {
+    metadataInnertube = Innertube.create({
+      cache: new UniversalCache(true),
+      // YTMUSIC gives us music.search / music.getInfo / music.getAlbum /
+      // music.getArtist with rich, music-oriented metadata (album, artists,
+      // release year, etc.) that the plain WEB client does not expose.
+      client_type: ClientType.MUSIC
+    });
+    // Don't leave a rejected promise memoized — a transient failure (e.g. a
+    // network blip during session init) shouldn't permanently break every
+    // future call for the rest of the process's lifetime.
+    metadataInnertube.catch(() => { metadataInnertube = undefined; });
+  }
   return metadataInnertube;
 }
 
@@ -45,23 +53,26 @@ export async function getMetadataInnertube(): Promise<Innertube> {
  * cannot extract (items come back empty even though a continuation exists).
  *
  * We therefore keep a dedicated WEB instance here, separate from the music
- * metadata instance, and reuse it for the lifetime of the process.
+ * metadata instance, and reuse it for the lifetime of the process. As with
+ * `getMetadataInnertube`, the in-flight `Promise` is memoized so concurrent
+ * first-time callers share one session creation instead of racing to create
+ * their own.
  */
-let playlistInnertube: Innertube | undefined;
+let playlistInnertube: Promise<Innertube> | undefined;
 
 /**
  * Returns the shared playlist Innertube instance (regular WEB client),
  * creating it on first use.
  */
-export async function getPlaylistInnertube(): Promise<Innertube> {
-  if (playlistInnertube) return playlistInnertube;
-
-  playlistInnertube = await Innertube.create({
-    cache: new UniversalCache(true),
-    // The plain WEB client is required for getPlaylist() to return
-    // continuable PlaylistVideo items.
-    client_type: ClientType.WEB
-  });
-
+export function getPlaylistInnertube(): Promise<Innertube> {
+  if (!playlistInnertube) {
+    playlistInnertube = Innertube.create({
+      cache: new UniversalCache(true),
+      // The plain WEB client is required for getPlaylist() to return
+      // continuable PlaylistVideo items.
+      client_type: ClientType.WEB
+    });
+    playlistInnertube.catch(() => { playlistInnertube = undefined; });
+  }
   return playlistInnertube;
 }

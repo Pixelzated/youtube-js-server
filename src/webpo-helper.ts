@@ -173,6 +173,19 @@ export async function getWebPoMinter(innertube: Innertube): Promise<CachedMinter
   return minterInitPromise;
 }
 
+/**
+ * Drops the cached WebPoMinter, forcing the next `getWebPoMinter()` call to
+ * pay the full BotGuard challenge + integrity-token cost again. Used when a
+ * long-lived session appears to have gone stale (e.g. the WEB player stops
+ * returning `server_abr_streaming_url` — see sabr-stream-factory.ts) so the
+ * server can self-heal by starting a fresh session instead of requiring a
+ * manual restart.
+ */
+export function resetWebPoMinter(): void {
+  cachedMinter = undefined;
+  minterInitPromise = undefined;
+}
+
 // ---------------------------------------------------------------------------
 // Per-video PoToken minting (the cheap part — local crypto, no network)
 // ---------------------------------------------------------------------------

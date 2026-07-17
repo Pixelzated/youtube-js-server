@@ -107,6 +107,10 @@ curl http://localhost:3001/playlist/PLFgquLnBQx4RJzCeI9gR7qZcBxgQZ9GZp
 
 # Lighter response: just the video id array
 curl 'http://localhost:3001/playlist/PLFgquLnBQx4RJzCeI9gR7qZcBxgQZ9GZp?idsOnly=true'
+
+# Fast partial response: stop after the first ~20 entries instead of
+# walking the whole playlist
+curl 'http://localhost:3001/playlist/PLFgquLnBQx4RJzCeI9gR7qZcBxgQZ9GZp?limit=20'
 ```
 
 Search results and metadata responses include title, artist, channel, album,
@@ -121,8 +125,20 @@ The `:id` accepts any YouTube playlist id (`PL...`, `OLAK5uy...`,
 `RDCLAK...`, `RD...`, `UU...`, etc.), optionally `VL`-prefixed.
 
 The response includes both a flat `videoIds` array and a richer `videos`
-array (with per-entry title, 1-based index, and duration). Pass
+array (with per-entry title, 1-based index, duration, and artist). Pass
 `?idsOnly=true` to get just the ids for a smaller payload.
+
+Results are cached for 30 minutes, so repeat requests for the same playlist
+are near-instant. A **cold** fetch of a large playlist is still one network
+round-trip per ~100 videos, and — unlike track/album/artist/search lookups —
+those round-trips can't happen concurrently: each page's continuation token
+only exists inside the *previous* page's response, so YouTube is walked one
+page at a time. For a playlist the server hasn't seen yet, pass `?limit=N`
+to stop paginating once at least `N` entries have been collected instead of
+walking the whole thing — useful for an initial UI render that only needs
+the first page and can lazy-load the rest. A `limit`ed request bypasses the
+cache in both directions (it won't serve a capped result to a later
+full-playlist request, and won't itself reuse a cached full one).
 
 ```json
 {
@@ -132,7 +148,13 @@ array (with per-entry title, 1-based index, and duration). Pass
   "returnedCount": 1230,
   "videoIds": ["abc123", "def456", "..."],
   "videos": [
-    { "id": "abc123", "title": "First Track", "index": 1, "duration": { "seconds": 213, "text": "3:33" } },
+    {
+      "id": "abc123",
+      "title": "First Track",
+      "index": 1,
+      "duration": { "seconds": 213, "text": "3:33" },
+      "artist": { "name": "Some Artist", "id": "UC..." }
+    },
     "..."
   ]
 }
@@ -140,6 +162,20 @@ array (with per-entry title, 1-based index, and duration). Pass
 
 `returnedCount` may be less than `videoCount` when the playlist contains
 private or deleted entries (which have no usable id).
+
+`artist` here is the **uploading channel's display name as shown in the
+playlist listing**, not a resolved recording-artist name — it costs no extra
+request, but it can be wrong or noisy (e.g. a fan-upload channel like
+`HouseOfPainTV` instead of `House of Pain`). `GET /metadata/:id` resolves the
+real, canonical artist per track (see below) at the cost of one extra
+request per video; that's the right call if per-track accuracy matters more
+than playlist load time. `artist` is omitted entirely when no name is
+available; its `id` is only present for entries backed by the legacy
+`PlaylistVideo` node (see
+[`METADATA_LIMITATIONS.md`](./METADATA_LIMITATIONS.md)) — the newer
+`LockupView` node YouTube now returns for most playlists only exposes the
+artist name, not a channel id. `duration` is similarly only available on the
+legacy node.
 
 See [`METADATA_LIMITATIONS.md`](./METADATA_LIMITATIONS.md) for a full list of
 fields that youtubei.js cannot reliably provide (e.g. likes, album year in

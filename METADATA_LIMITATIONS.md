@@ -10,7 +10,7 @@ for YouTube Music metadata. The implementation omits these fields (or returns
 | --- | --- | --- |
 | `id` | ✅ Always | From the requested video id. |
 | `title` | ✅ Always | From `basic_info.title`. |
-| `artist` | ✅ Usually | From `basic_info.channel` (the uploader). For music tracks this is typically the artist, but it may differ for compilations. |
+| `artist` | ✅ Usually | From the Up Next panel's matching entry's `artists[0]` (parsed from `longBylineText` runs pointing at a real `UC...` channel) — the canonical recording artist, which can differ from the uploading channel (e.g. a fan upload on channel "HouseOfPainTV" still resolves to artist "House of Pain" on its own official channel). Falls back to `basic_info.channel`/`author` (the uploading channel) when Up Next has no artist match. `microformat.tags` was tried as a zero-cost alternative but rejected: it's only `[artist, album, track]` for curated YTMUSIC catalog entries — for regular uploaded music videos it's just the uploader's raw, unordered, lowercase SEO keyword tags. |
 | `channel` | ✅ Usually | Same source as `artist`. |
 | `album.name` | ✅ For music tracks | Extracted from the Up Next panel's `PlaylistPanelVideo.album`. `null` for standalone videos. |
 | `album.year` | ⚠️ Sometimes | Only present when the Up Next panel includes `album.year`. Some tracks omit it even when the album is known. |
@@ -65,6 +65,21 @@ When unavailable, `album.year` and `releaseYear` are omitted.
 | `name` | ✅ Always | From the artist header title. |
 | `thumbnails` | ✅ Usually | From `MusicImmersiveHeader.thumbnail` or `MusicVisualHeader.thumbnail`. |
 | `subscribers` | ⚠️ Sometimes | Extracted from the `SubscribeButton`'s accessibility label (e.g. "Subscribe to this channel. 502 thousand"). Not available for all artists. |
+
+## `getPlaylist(playlistId)` — PlaylistVideoEntry (per video)
+
+Playlist items come from two different node types depending on what YouTube's
+web UI returns for a given playlist (the newer `LockupView` is far more
+common today, but older/legacy `PlaylistVideo` rows still occur).
+
+| Field | Availability | Notes |
+| --- | --- | --- |
+| `id` | ✅ Always | Entries without a usable id (private/deleted placeholders) are dropped. |
+| `title` | ✅ Always | |
+| `index` | ✅ Always | 1-based position in the (deduped) returned list. |
+| `duration` | ⚠️ Legacy node only | Only present on `PlaylistVideo` rows. `LockupView` rows never include a duration — call `getMetadata(id)` if needed. |
+| `artist.name` | ⚠️ Usually, may be wrong | `PlaylistVideo` rows use the structured `.author.name`; `LockupView` rows fall back to the first metadata row's text. Both are the **uploading channel's display name in this playlist context**, not a resolved recording artist — YouTube sometimes displays the raw channel title here (e.g. `HouseOfPainTV`) even when `getMetadata`'s Up Next lookup resolves the same video to the canonical artist (`House of Pain`, a different channel id). No extra request is made to correct this — see `getMetadata`'s `artist` row above for the accurate source. Omitted if no name is available at all. |
+| `artist.id` | ⚠️ Legacy node only | Only `PlaylistVideo`'s `.author.id` provides a channel id (the uploading channel's id, same caveat as `artist.name`). `LockupView`'s metadata rows are plain text with no structured id, so `artist.id` is never set for those rows. |
 
 ## General notes
 

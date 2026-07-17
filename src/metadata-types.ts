@@ -113,6 +113,8 @@ export interface PlaylistVideoEntry {
   /** Position of the video in the playlist (1-based). */
   index: number;
   duration?: MetadataDuration;
+  /** Uploading channel / artist, when available. */
+  artist?: MetadataEntity;
 }
 
 export interface PlaylistMetadata {
