@@ -44,29 +44,46 @@ function setupBotguardEnvironment(): void {
   botguardEnvSetup = true;
 }
 
+// ---------------------------------------------------------------------------
+// Cached WebPoMinter (the expensive part — created once, reused forever)
+// ---------------------------------------------------------------------------
+
 /**
- * Generates a Web Proof-of-Origin (PoToken) using the same approach as the
- * original lib-origin node_potoken: it acquires the BotGuard challenge from
- * YouTube's own attestation API (innertube.getAttestationChallenge) rather
- * than bgutils-js' challenge server. This produces a token YouTube's SABR
- * backend actually accepts.
+ * A cached WebPoMinter plus the visitorData of the Innertube session it was
+ * created with. The minter itself is cheap to reuse: `mintAsWebsafeString(id)`
+ * is a local cryptographic operation with no network I/O. The expensive parts
+ * (BotGuard challenge fetch, interpreter download/execution, snapshot, and
+ * integrity-token exchange) only happen once during `initWebPoMinter()`.
  *
- * @param innertube - The youtubei.js Innertube instance.
- * @param contentBinding - The content binding (video id) for the PoToken.
+ * This mirrors the official googlevideo SABR Shaka example, which creates a
+ * `BotguardService` singleton and reuses its `integrityTokenBasedMinter` for
+ * every subsequent video, minting a fresh per-video PoToken from it each time.
  */
-export async function generateWebPoToken(
-  innertube: Innertube,
-  contentBinding: string
-): Promise<{
+interface CachedMinter {
+  minter: InstanceType<typeof BG.WebPoMinter>;
+  /** visitorData of the Innertube session the minter was created with. */
   visitorData: string;
-  placeholderPoToken: string;
-  poToken: string;
-}> {
+}
+
+let cachedMinter: CachedMinter | undefined;
+let minterInitPromise: Promise<CachedMinter> | undefined;
+
+/**
+ * Creates the WebPoMinter by solving a BotGuard challenge from YouTube's
+ * attestation API and exchanging it for an integrity token. This is the
+ * expensive operation (multiple network round-trips + VM execution) and is
+ * only performed once; subsequent calls reuse the cached minter.
+ *
+ * The `visitorData` from the supplied Innertube session is embedded in the
+ * challenge flow, so the same Innertube instance (or at least one with the
+ * same visitorData) must be used for the player request.
+ */
+async function initWebPoMinter(innertube: Innertube): Promise<CachedMinter> {
   setupBotguardEnvironment();
 
   const visitorData = innertube.session.context.client.visitorData as string | undefined;
-  if (!visitorData && !contentBinding) {
-    throw new Error('No identifier provided and no visitorData on the Innertube session.');
+  if (!visitorData) {
+    throw new Error('No visitorData on the Innertube session.');
   }
 
   // Acquire the BotGuard challenge from YouTube's attestation API.
@@ -131,14 +148,80 @@ export async function generateWebPoToken(
     webPoSignalOutput
   );
 
-  const poToken = await webPoMinter.mintAsWebsafeString(contentBinding);
+  return { minter: webPoMinter, visitorData };
+}
 
-  // generatePlaceholder throws if contentBinding > 118 UTF-8 bytes.
+/**
+ * Returns the cached WebPoMinter, creating it on first use. Concurrent callers
+ * share the same initialization promise so the expensive BotGuard flow only
+ * runs once even if multiple streams start simultaneously.
+ */
+export async function getWebPoMinter(innertube: Innertube): Promise<CachedMinter> {
+  if (cachedMinter) return cachedMinter;
+  if (minterInitPromise) return minterInitPromise;
+
+  minterInitPromise = initWebPoMinter(innertube).then((result) => {
+    cachedMinter = result;
+    minterInitPromise = undefined;
+    console.log('[webpo] WebPoMinter initialized and cached; subsequent streams will reuse it');
+    return result;
+  }).catch((e) => {
+    minterInitPromise = undefined;
+    throw e;
+  });
+
+  return minterInitPromise;
+}
+
+/**
+ * Drops the cached WebPoMinter, forcing the next `getWebPoMinter()` call to
+ * pay the full BotGuard challenge + integrity-token cost again. Used when a
+ * long-lived session appears to have gone stale (e.g. the WEB player stops
+ * returning `server_abr_streaming_url` — see sabr-stream-factory.ts) so the
+ * server can self-heal by starting a fresh session instead of requiring a
+ * manual restart.
+ */
+export function resetWebPoMinter(): void {
+  cachedMinter = undefined;
+  minterInitPromise = undefined;
+}
+
+// ---------------------------------------------------------------------------
+// Per-video PoToken minting (the cheap part — local crypto, no network)
+// ---------------------------------------------------------------------------
+
+/**
+ * Mints a Web Proof-of-Origin (PoToken) for the given video id, reusing the
+ * cached WebPoMinter. The token is bound to the video id (the
+ * `contentBinding`/`identifier` passed to `mintAsWebsafeString`), which
+ * matches what the official googlevideo examples do.
+ *
+ * This is cheap: it's a local cryptographic operation with no network
+ * round-trips. The expensive BotGuard challenge + integrity-token exchange
+ * happened once when the minter was first created.
+ *
+ * @param innertube - The Innertube instance (must have the same visitorData
+ *   as the one used to create the minter; use `getStreamingInnertube()`).
+ * @param videoId - The video id to bind the token to.
+ */
+export async function generateWebPoToken(
+  innertube: Innertube,
+  videoId: string
+): Promise<{
+  visitorData: string;
+  placeholderPoToken: string;
+  poToken: string;
+}> {
+  const { minter, visitorData } = await getWebPoMinter(innertube);
+
+  const poToken = await minter.mintAsWebsafeString(videoId);
+
+  // generateColdStartToken throws if the identifier > 118 UTF-8 bytes.
   // The video id is always short, so this is safe.
-  const placeholderPoToken = BG.PoToken.generateColdStartToken(contentBinding);
+  const placeholderPoToken = BG.PoToken.generateColdStartToken(videoId);
 
   return {
-    visitorData: visitorData ?? contentBinding,
+    visitorData,
     placeholderPoToken,
     poToken
   };

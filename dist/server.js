@@ -3,7 +3,9 @@ import cors from 'cors';
 import { EventEmitter } from 'node:events';
 import { EnabledTrackTypes } from 'googlevideo/utils';
 import { createSabrAudioStream } from './sabr-stream-factory.js';
+import { createDirectAudioStream } from './direct-stream-factory.js';
 import { search, getMetadata, getAlbum, getArtist, getPlaylist } from './metadata-factory.js';
+import { getMetadataInnertube, getPlaylistInnertube } from './innertube-helper.js';
 const app = express();
 app.use(express.json());
 app.use(cors());
@@ -63,11 +65,11 @@ function evictOldestStream() {
         return;
     console.log(`[stream] evicting oldest active stream ${oldestKey} ` +
         `(started ${Date.now() - oldest.startedAt}ms ago) to make room for new request`);
-    // Abort the underlying SABR download. This will cause the reader loop in
+    // Abort the underlying download. This will cause the reader loop in
     // getOrStartTrack to throw, which sets track.done/error and emits 'error'.
     // The catch block already deletes the track from the map.
     try {
-        oldest.sabrStream?.abort();
+        oldest.abort?.();
     }
     catch {
         // abort() can throw if the stream is already closing — ignore.
@@ -82,17 +84,50 @@ function evictOldestStream() {
         oldest.emitter.emit('error', oldest.error);
     }
 }
+async function startSabr(videoId, options) {
+    const { streamResults, sabrStream } = await createSabrAudioStream(videoId, options);
+    return { streamResults, abort: () => sabrStream.abort() };
+}
 /**
- * Returns an existing in-progress track, or starts a new SABR download for
- * the given video id. The download runs in the background and emits
- * 'ready' | 'data' | 'end' | 'error' on its emitter so HTTP handlers can
- * stream bytes as they arrive.
+ * Starts the requested engine. 'ios' fails fast on its first chunk (see
+ * direct-stream-factory.ts's FIRST_CHUNK_RETRY_BUDGET — a ~1s budget) so a
+ * persistent 403 falls back to the SABR engine here rather than leaving the
+ * caller waiting on a long, doomed retry loop with nothing to show for it.
+ * Once past the first chunk, 'ios' has no fallback (audio has already
+ * reached the client) and just retries with a more patient budget.
+ */
+async function startEngine(videoId, options, engine, key) {
+    if (engine === 'sabr')
+        return startSabr(videoId, options);
+    try {
+        return await createDirectAudioStream(videoId);
+    }
+    catch (e) {
+        console.warn(`[stream] [${key}] ios engine failed, falling back to sabr:`, e instanceof Error ? e.message : e);
+        return startSabr(videoId, options);
+    }
+}
+/**
+ * Returns an existing in-progress track, or starts a new download for the
+ * given video id using the requested engine. The download runs in the
+ * background and emits 'ready' | 'data' | 'end' | 'error' on its emitter so
+ * HTTP handlers can stream bytes as they arrive.
+ *
+ * 'sabr' (default) is the standard WEB-client SABR pipeline. 'ios' is an
+ * experimental alternative (see direct-stream-factory.ts) that fetches a
+ * direct, pre-signed adaptive format URL from the IOS client instead —
+ * avoids YouTube's SABR anti-adblock backoff (near-instant start), at the
+ * cost of AAC-only audio (no Opus) and occasional transient 403s (retried;
+ * falls back to 'sabr' if the very first chunk can't recover quickly).
+ * Each (videoId, engine) pair gets its own buffer, since the two engines
+ * produce different formats/mime types for the same video.
  *
  * If the concurrency limit has been reached, the oldest active stream is
  * evicted (aborted) before the new one starts — the request is never denied.
  */
-function getOrStartTrack(videoId, options) {
-    const existing = tracks.get(videoId);
+function getOrStartTrack(videoId, options, engine) {
+    const key = `${engine}:${videoId}`;
+    const existing = tracks.get(key);
     if (existing)
         return existing;
     // Evict the oldest active stream if we're at the concurrency limit.
@@ -111,11 +146,11 @@ function getOrStartTrack(videoId, options) {
     };
     // Guard against unhandled 'error' emissions which would crash the process.
     track.emitter.on('error', () => { });
-    tracks.set(videoId, track);
+    tracks.set(key, track);
     (async () => {
         try {
-            const { streamResults, sabrStream } = await createSabrAudioStream(videoId, options);
-            track.sabrStream = sabrStream;
+            const { streamResults, abort } = await startEngine(videoId, options, engine, key);
+            track.abort = abort;
             const audioFormat = streamResults.selectedFormats.audioFormat;
             track.mimeType = audioFormat?.mimeType?.split(';')[0] ?? 'audio/webm';
             if (audioFormat?.contentLength && audioFormat.contentLength > 0) {
@@ -140,17 +175,23 @@ function getOrStartTrack(videoId, options) {
             track.emitter.emit('end');
         }
         catch (e) {
+            // NOTE: do NOT set track.done here — pump() in serveRange() treats
+            // `done` as "successfully finished," so setting it on an error path
+            // makes an in-progress range request see the partial buffer as
+            // complete and end the HTTP response cleanly (silent truncation,
+            // no error surfaced to the client). track.error + the 'error' emit
+            // are what unblock waiters and trigger onError's res.destroy().
             track.error = e instanceof Error ? e : new Error(String(e));
             track.ready = true;
-            track.done = true;
-            tracks.delete(videoId);
+            tracks.delete(key);
+            console.error(`[stream] [${key}] download failed:`, track.error);
             track.emitter.emit('error', track.error);
         }
     })().catch((e) => {
         track.error = e instanceof Error ? e : new Error(String(e));
         track.ready = true;
-        track.done = true;
-        tracks.delete(videoId);
+        tracks.delete(key);
+        console.error(`[stream] [${key}] download failed:`, track.error);
         track.emitter.emit('error', track.error);
     });
     return track;
@@ -289,7 +330,10 @@ app.get('/stream/:id', async (req, res) => {
     if (typeof req.query.audioQuality === 'string') {
         options.audioQuality = req.query.audioQuality;
     }
-    const track = getOrStartTrack(videoId, options);
+    // `?engine=ios` opts into the experimental direct-fetch pipeline instead of
+    // the default SABR one — see direct-stream-factory.ts for the tradeoffs.
+    const engine = req.query.engine === 'ios' ? 'ios' : 'sabr';
+    const track = getOrStartTrack(videoId, options, engine);
     try {
         await waitForTrackReady(track);
     }
@@ -447,8 +491,26 @@ app.get('/playlist/:id', async (req, res) => {
     // Optional `?idsOnly=true` returns just the video id array (lighter payload
     // for clients that only need ids, e.g. to feed into /stream/:id).
     const idsOnly = req.query.idsOnly === 'true';
+    // Optional `?limit=N` stops paginating once at least N entries have been
+    // collected, instead of walking the entire playlist. Large playlists are
+    // paginated one network round-trip per ~100 videos and pages can't be
+    // fetched concurrently (each continuation token only exists inside the
+    // previous page's response), so this is the way to get a fast response
+    // out of a playlist the server hasn't seen before — e.g. an initial UI
+    // render that only needs the first page. Skips the result cache (see
+    // getPlaylist in metadata-factory.ts) since a capped result shouldn't be
+    // served back for a later request that wants the full playlist.
+    let maxItems;
+    if (typeof req.query.limit === 'string') {
+        const parsed = parseInt(req.query.limit, 10);
+        if (!Number.isFinite(parsed) || parsed <= 0) {
+            sendError(res, 400, 'Invalid "limit"; must be a positive integer');
+            return;
+        }
+        maxItems = parsed;
+    }
     try {
-        const playlist = await getPlaylist(playlistId);
+        const playlist = await getPlaylist(playlistId, { maxItems });
         if (!playlist) {
             sendError(res, 404, 'Playlist not found or is empty');
             return;
@@ -489,6 +551,17 @@ app.get('/health', (_req, res) => {
             error: t.error?.message
         }))
     });
+});
+// Pre-warm both Innertube sessions (metadata + playlist) at startup instead
+// of paying their ~250-300ms session-init cost on whichever request happens
+// to arrive first. Fire-and-forget: the HTTP server below doesn't wait on
+// this, and a failure here just means the first real request pays the cost
+// (and surfaces the error) itself, same as before this existed.
+getMetadataInnertube().catch((e) => {
+    console.warn('[metadata] session pre-warm failed (will retry on first request):', e instanceof Error ? e.message : e);
+});
+getPlaylistInnertube().catch((e) => {
+    console.warn('[playlist] session pre-warm failed (will retry on first request):', e instanceof Error ? e.message : e);
 });
 app.listen(PORT, HOST, () => {
     console.log(`YouTube audio stream server listening on http://${HOST}:${PORT}`);
